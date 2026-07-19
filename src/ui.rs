@@ -4,7 +4,9 @@ pub fn prompt_input(prompt: &str) -> String {
     print!("{}", prompt);
     io::stdout().flush().unwrap();
     let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
+    if io::stdin().read_line(&mut input).unwrap_or(0) == 0 {
+        return String::new();
+    }
     input.trim().to_string()
 }
 
@@ -20,7 +22,7 @@ pub fn print_menu(title: &str, items: &[&str], show_back: bool) -> Option<usize>
         println!("  q. Quit");
 
         let choice_str = prompt_input("Enter choice: ");
-        if choice_str == "q" || choice_str == "Q" {
+        if choice_str.is_empty() || choice_str == "q" || choice_str == "Q" {
             return None;
         }
 

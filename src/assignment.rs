@@ -76,9 +76,16 @@ pub fn handle_assignment(
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
 
+    let userid = params
+        .iter()
+        .find(|(n, _)| n == "userid")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| "12501".to_string());
+
     println!("  sesskey: {}", sesskey);
     println!("  file_draft_id: {}", file_draft_id);
     println!("  lastmodified: {}", lastmodified);
+    println!("  userid: {}", userid);
 
     let author_name = {
         let usertext_sel = Selector::parse(".usertext").expect("bad selector: .usertext");
@@ -136,7 +143,7 @@ pub fn handle_assignment(
     let delete_params = [
         ("id", assignment_id.to_string()),
         ("action", "removesubmission".to_string()),
-        ("userid", "12501".to_string()),
+        ("userid", userid.clone()),
         ("sesskey", confirm_sesskey),
     ];
     client
@@ -557,7 +564,7 @@ pub fn handle_assignment(
     let submit_form = reqwest::blocking::multipart::Form::new()
         .text("action", "savesubmission")
         .text("id", assignment_id.to_string())
-        .text("userid", "12501".to_string())
+        .text("userid", userid.clone())
         .text("lastmodified", fresh_lastmodified)
         .text("sesskey", final_sesskey_for_submit)
         .text("_qf__mod_assign_submission_form", "1")
