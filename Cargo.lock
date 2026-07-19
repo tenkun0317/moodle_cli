@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "moodle_cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "regex",
  "reqwest",
@@ -1239,6 +1239,7 @@ dependencies = [
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
+ "serde_json",
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",

@@ -1,10 +1,19 @@
 use std::env;
+use std::fs;
+use std::path::Path;
 
 use reqwest::blocking::Client;
 use scraper::{ElementRef, Html, Selector};
 
-use crate::types::{LOGIN_URL, MOODLE_BASE};
-use crate::ui::prompt_input;
+use crate::types::{DEBUG_DIR, LOGIN_URL, MOODLE_BASE};
+use crate::ui::{prompt_input, prompt_yes_no};
+
+fn save_debug_page(name: &str, body: &str) {
+    let dir = Path::new(DEBUG_DIR);
+    fs::create_dir_all(dir).ok();
+    let path = dir.join(format!("auth_{name}.html"));
+    let _ = fs::write(&path, body);
+}
 
 fn get_totp_secret() -> Option<String> {
     env::var("UEC_KEY").ok()
@@ -31,7 +40,7 @@ fn generate_totp(secret_str: &str) -> String {
     totp.generate(now)
 }
 
-fn process_saml_response(client: &Client, saml_form: ElementRef) {
+fn process_saml_response(client: &Client, saml_form: ElementRef) -> bool {
     let saml_action = saml_form
         .value()
         .attr("action")
@@ -55,10 +64,19 @@ fn process_saml_response(client: &Client, saml_form: ElementRef) {
 
     if let (Some(relay), Some(response)) = (relay_state, saml_response) {
         let action_decoded = saml_action.replace("&#x3a;", ":").replace("&#x2f;", "/");
-        let _ = client
+        match client
             .post(&action_decoded)
             .form(&[("RelayState", &relay), ("SAMLResponse", &response)])
-            .send();
+            .send()
+        {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("  [!] SAML POST failed: {e}");
+                false
+            }
+        }
+    } else {
+        false
     }
 }
 
@@ -66,6 +84,7 @@ pub fn login(client: &Client, username: &str, password: &str) -> bool {
     let form_sel = Selector::parse("form").expect("bad selector: form");
     let csrf_sel = Selector::parse("input[name=csrf_token]").expect("bad selector: csrf_token");
     let authcode_sel = Selector::parse("input[name=authcode]").expect("bad selector: authcode");
+    let mfa_type_sel = Selector::parse("select[name=mfa_type]").expect("bad selector: mfa_type");
     let title_sel = Selector::parse("title").expect("bad selector: title");
 
     println!("  Getting initial login page...");
@@ -78,6 +97,7 @@ pub fn login(client: &Client, username: &str, password: &str) -> bool {
     };
     let origin = resp.url().origin().ascii_serialization();
     let body = resp.text().unwrap_or_default();
+    save_debug_page("01_initial_login", &body);
     if body.is_empty() {
         eprintln!("  [!] Empty login page");
         return false;
@@ -112,7 +132,9 @@ pub fn login(client: &Client, username: &str, password: &str) -> bool {
             return false;
         }
     };
+    let _shib_origin = resp2.url().origin().ascii_serialization();
     let body2 = resp2.text().unwrap_or_default();
+    save_debug_page("02_idp_login", &body2);
     if body2.is_empty() {
         eprintln!("  [!] Empty response after initial form");
         return false;
@@ -151,18 +173,24 @@ pub fn login(client: &Client, username: &str, password: &str) -> bool {
         }
     };
     let body3 = resp3.text().unwrap_or_default();
+    save_debug_page("03_after_credentials", &body3);
     let doc3 = Html::parse_document(&body3);
 
-    let has_otp = doc3.select(&authcode_sel).next().is_some();
+    let has_authcode = doc3.select(&authcode_sel).next().is_some();
+    let option_sel = Selector::parse("option").expect("bad selector: option");
+    let mfa_select = doc3.select(&mfa_type_sel).next();
+    let mailotp_available = mfa_select
+        .iter()
+        .flat_map(|s| s.select(&option_sel))
+        .any(|opt| opt.value().attr("value") == Some("mailotp"));
 
-    if has_otp {
+    if has_authcode || mfa_select.is_some() {
         println!("  2FA required...");
-        let otp_code = if let Some(secret) = get_totp_secret() {
-            println!("  Auto-generating TOTP...");
-            generate_totp(&secret)
+
+        let use_mailotp = if mailotp_available {
+            prompt_yes_no("  Use mail OTP instead of TOTP?")
         } else {
-            println!("  Enter TOTP code manually:");
-            prompt_input("  TOTP code: ")
+            false
         };
 
         let otp_form = match doc3.select(&form_sel).next() {
@@ -178,32 +206,118 @@ pub fn login(client: &Client, username: &str, password: &str) -> bool {
             .next()
             .map(|i| i.value().attr("value").unwrap_or("").to_string())
             .unwrap_or_default();
-
         let otp_url = format!("https://shibboleth.cc.uec.ac.jp{}", otp_action);
-        let form_data: Vec<(&str, &str)> = vec![
-            ("csrf_token", &otp_csrf),
-            ("mfa_type", "totp"),
-            ("authcode", &otp_code),
-            ("login", "ログイン"),
-        ];
-        let resp_otp = match client.post(&otp_url).form(&form_data).send() {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("  [!] 2FA submission failed: {e}");
+
+        if use_mailotp {
+            println!("  Requesting mail OTP...");
+            let req_data: Vec<(&str, &str)> = vec![
+                ("csrf_token", &otp_csrf),
+                ("mfa_type", "mailotp"),
+                ("authcode", "0"),
+                ("login", "ログイン"),
+            ];
+            let resp = match client.post(&otp_url).form(&req_data).send() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  [!] mail OTP request failed: {e}");
+                    return false;
+                }
+            };
+            let body = resp.text().unwrap_or_default();
+            let doc = Html::parse_document(&body);
+            let csrf2 = doc
+                .select(&csrf_sel)
+                .next()
+                .map(|i| i.value().attr("value").unwrap_or("").to_string())
+                .unwrap_or_default();
+
+            let code = prompt_input("  Mail OTP code: ");
+            let sub_data: Vec<(&str, &str)> = vec![
+                ("csrf_token", &csrf2),
+                ("mfa_type", "mailotp"),
+                ("authcode", &code),
+                ("login", "ログイン"),
+            ];
+            let resp2 = match client.post(&otp_url).form(&sub_data).send() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  [!] mail OTP submission failed: {e}");
+                    return false;
+                }
+            };
+            let body2 = resp2.text().unwrap_or_default();
+            save_debug_page("04_after_mailotp", &body2);
+            let otp_doc = Html::parse_document(&body2);
+
+            if otp_doc.select(&authcode_sel).next().is_some() {
+                eprintln!("  [!] Mail OTP code rejected (still on OTP page)");
                 return false;
             }
-        };
-        let body_otp = resp_otp.text().unwrap_or_default();
-        match Html::parse_document(&body_otp).select(&form_sel).next() {
-            Some(saml_form) => process_saml_response(client, saml_form),
-            None => {
-                eprintln!("  [!] No SAML form after 2FA");
+
+            match otp_doc.select(&form_sel).next() {
+                Some(saml_form) => {
+                    if !process_saml_response(client, saml_form) {
+                        eprintln!("  [!] SAML response submission failed after mail OTP");
+                        return false;
+                    }
+                }
+                None => {
+                    eprintln!("  [!] No SAML form after mail OTP");
+                    return false;
+                }
+            }
+        } else {
+            let otp_code = if let Some(secret) = get_totp_secret() {
+                println!("  Auto-generating TOTP...");
+                generate_totp(&secret)
+            } else {
+                println!("  Enter TOTP code manually:");
+                prompt_input("  TOTP code: ")
+            };
+
+            let sub_data: Vec<(&str, &str)> = vec![
+                ("csrf_token", &otp_csrf),
+                ("mfa_type", "totp"),
+                ("authcode", &otp_code),
+                ("login", "ログイン"),
+            ];
+            let resp_otp = match client.post(&otp_url).form(&sub_data).send() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("  [!] 2FA submission failed: {e}");
+                    return false;
+                }
+            };
+            let body_otp = resp_otp.text().unwrap_or_default();
+            save_debug_page("04_after_totp", &body_otp);
+            let otp_doc = Html::parse_document(&body_otp);
+
+            if otp_doc.select(&authcode_sel).next().is_some() {
+                eprintln!("  [!] TOTP code rejected (still on OTP page)");
                 return false;
+            }
+
+            match otp_doc.select(&form_sel).next() {
+                Some(saml_form) => {
+                    if !process_saml_response(client, saml_form) {
+                        eprintln!("  [!] SAML response submission failed after 2FA");
+                        return false;
+                    }
+                }
+                None => {
+                    eprintln!("  [!] No SAML form after 2FA");
+                    return false;
+                }
             }
         }
     } else {
         match doc3.select(&form_sel).next() {
-            Some(saml_form) => process_saml_response(client, saml_form),
+            Some(saml_form) => {
+                if !process_saml_response(client, saml_form) {
+                    eprintln!("  [!] SAML response submission failed");
+                    return false;
+                }
+            }
             None => {
                 eprintln!("  [!] No SAML form after login");
                 return false;
@@ -218,7 +332,9 @@ pub fn login(client: &Client, username: &str, password: &str) -> bool {
             return false;
         }
     };
+    let final_url = test_resp.url().as_str().to_string();
     let test_body = test_resp.text().unwrap_or_default();
+    save_debug_page("05_dashboard", &test_body);
     let test_doc = Html::parse_document(&test_body);
     let test_title = test_doc
         .select(&title_sel)
@@ -226,8 +342,11 @@ pub fn login(client: &Client, username: &str, password: &str) -> bool {
         .map(|t| t.text().collect::<String>())
         .unwrap_or_default();
 
-    if test_title.contains("ログイン") || test_title.contains("Login") {
-        println!("  [!] Still on login page after authentication");
+    let on_moodle = final_url.starts_with(MOODLE_BASE);
+    let on_login_page = test_title.contains("ログイン") || test_title.contains("Login");
+
+    if !on_moodle || on_login_page {
+        println!("  [!] Still on login page after authentication (redirected to: {final_url})");
         false
     } else {
         println!("  Login successful!");
