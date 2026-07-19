@@ -1,6 +1,6 @@
 [package]
 name = "moodle_cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,7 @@ reqwest = { version = "0.13", features = [
   "blocking",
   "cookies",
   "form",
+  "json",
   "multipart",
 ] }
 rpassword = "7.5.4"

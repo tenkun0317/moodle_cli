@@ -10,6 +10,11 @@ pub fn prompt_input(prompt: &str) -> String {
     input.trim().to_string()
 }
 
+pub fn prompt_yes_no(prompt: &str) -> bool {
+    let answer = prompt_input(&format!("{} (y/N): ", prompt));
+    answer.eq_ignore_ascii_case("y")
+}
+
 pub fn print_menu(title: &str, items: &[&str], show_back: bool) -> Option<usize> {
     loop {
         println!("\n=== {} ===", title);
